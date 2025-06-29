@@ -1,0 +1,154 @@
+#version: '3.7'
+
+## So this have been a project, fighting with CHatGPT, yes, I went there, but on the flip side, this is a great stack and I can just add to it ###
+
+services:
+
+  traefik:
+    image: traefik:v2.10
+    container_name: traefik
+    command:
+      - "--api.insecure=true" # ⚠️ Remove or secure this in production
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.le.acme.httpchallenge=true"
+      - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.le.acme.email=you@associatedct.com"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "./letsencrypt:/letsencrypt"
+    networks:
+      - proxy
+
+## Static Page to show nextcloud is initializing, 1st Start Delays ##
+
+  init-page:
+    image: nginx:alpine
+    container_name: init-page
+    volumes:
+      - ./init.html:/usr/share/nginx/html/index.html
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.init-page.rule=Host(`init.drive.associatedct.com`)"
+      - "traefik.http.routers.init-page.entrypoints=websecure"
+      - "traefik.http.routers.init-page.tls.certresolver=le"
+      - "traefik.http.services.init-page.loadbalancer.server.port=80"
+    networks:
+      - proxy
+
+  db:
+    image: mariadb:10.11
+    container_name: nextcloud-db
+    restart: always
+    command: --transaction-isolation=READ-COMMITTED --binlog-format=ROW
+    environment:
+      - MYSQL_ROOT_PASSWORD=myrootpass
+      - MYSQL_PASSWORD=nextcloudpass
+      - MYSQL_DATABASE=nextcloud
+      - MYSQL_USER=nextcloud
+    volumes:
+      - db:/var/lib/mysql
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "mysqladmin", "-uroot", "-pmyrootpass",  "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: always
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nextcloud:
+    image: nextcloud:28.0.2-apache
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nextcloud
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    entrypoint: ["/wait-for-services.sh"]
+    environment:
+      - MYSQL_PASSWORD=nextcloudpass
+      - MYSQL_DATABASE=nextcloud
+      - MYSQL_USER=nextcloud
+      - MYSQL_HOST=db
+      - NEXTCLOUD_ADMIN_USER=admin
+      - NEXTCLOUD_ADMIN_PASSWORD=adminpass
+      - NEXTCLOUD_TRUSTED_DOMAINS=drive.associatedct.com
+      - REDIS_HOST=redis
+      - MYSQL_ROOT_PASSWORD=myrootpass
+    volumes:
+      - ./wait-for-services.sh:/wait-for-services.sh
+      - nextcloud:/var/www/html
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.nextcloud.rule=Host(`drive.associatedct.com`)"
+      - "traefik.http.routers.nextcloud.entrypoints=websecure"
+      - "traefik.http.routers.nextcloud.tls.certresolver=le"
+      - "traefik.http.services.nextcloud.loadbalancer.server.port=80"
+    networks:
+      - internal
+      - proxy
+
+  collabora:
+    image: collabora/code
+    container_name: collabora
+    restart: always
+    environment:
+      - domain=drive\\.associatedct\\.com
+      - username=admin
+      - password=secret
+      - extra_params=--o:ssl.enable=false --o:mount_jail_tree=false
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.collabora.rule=Host(`office.apps.associatedct.com`)"
+      - "traefik.http.routers.collabora.entrypoints=websecure"
+      - "traefik.http.routers.collabora.tls.certresolver=le"
+      - "traefik.http.services.collabora.loadbalancer.server.port=9980"
+    networks:
+      - proxy
+
+  restic-backup:
+    image: restic/restic:latest
+    container_name: restic-backup
+#    restart: unless-stopped
+    volumes:
+      - nextcloud:/mnt/data
+      - ./restic-repo:/mnt/restic-repo
+    environment:
+      - RESTIC_REPOSITORY=/mnt/restic-repo
+      - RESTIC_PASSWORD=myresticpass
+    networks:
+      - internal
+    # No entrypoint override. Run backups manually:
+    # docker compose run restic-backup backup /mnt/data
+
+networks:
+  proxy:
+    external: false
+  internal:
+    external: false
+
+volumes:
+  nextcloud:
+  db:
